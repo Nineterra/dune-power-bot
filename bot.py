@@ -131,6 +131,7 @@ async def mypower(ctx):
 async def tracker():
     now_utc = datetime.now(UTC)
     all_bases = get_all_bases()
+
     for entry in all_bases:
         uid = entry["user_id"]
         base = entry["base_name"]
@@ -138,20 +139,29 @@ async def tracker():
         set_at = entry["set_at"]
         warned = entry["warned"]
 
+        # Ensure set_at has timezone
         if set_at.tzinfo is None:
             set_at = UTC.localize(set_at)
 
         elapsed = int((now_utc - set_at).total_seconds() / 60)
         remaining = total_minutes - elapsed
 
+        # Debug logging
+        print(f"[Tracker] {base} (User {uid}) → Remaining: {remaining} mins, Warned: {warned}")
+
+        # Warn if less than 1 day remaining and not yet warned
         if 0 < remaining <= 1440 and not warned:
             set_warned(uid, base)
-            user = bot.get_user(int(uid))
-            if user:
-                try:
-                    await user.send(f"⚠️ **{base}** has less than 1 day remaining ({format_minutes(remaining)})")
-                except:
-                    pass
+
+            try:
+                user = await bot.fetch_user(int(uid))  # More reliable than get_user
+                await user.send(
+                    f"⚠️ **{base}** has less than **1 day** remaining "
+                    f"({format_minutes(remaining)})"
+                )
+                print(f"[Tracker] Warning sent to {uid} for base {base}")
+            except Exception as e:
+                print(f"[Tracker] Failed to send warning to {uid}: {e}")
 
     # Daily report at 13:00 UTC
     if now_utc.hour == 13 and now_utc.minute == 0:
@@ -166,10 +176,8 @@ async def tracker():
                 remaining = entry["total_minutes"] - elapsed
                 lines.append(f"**{entry['base_name']}** → {format_minutes(remaining)}")
             await channel.send("\n".join(lines))
+            print("[Tracker] Daily report sent")
 
-@tracker.before_loop
-async def before_tracker():
-    await bot.wait_until_ready()
 
 # ===== START =====
 init_db()
