@@ -1,144 +1,182 @@
+import os
 import discord
 from discord.ext import commands, tasks
-import json
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from pytz import UTC
+import psycopg2
 
-# ====== CONFIG ======
-import os
-TOKEN = os.getenv("DISCORD_TOKEN")
-DAILY_CHANNEL_ID = 682623773442179072
-NOTIFY_HOUR_CET = 13  # 13:00 CET for daily report
-DATA_FILE = "power_data.json"
+# ===== CONFIG =====
+TOKEN = os.environ["DISCORD_TOKEN"]        
+DATABASE_URL = os.environ["DATABASE_URL"]  
+DAILY_CHANNEL_ID = 1471493742879051972    
 
-# ====== BOT SETUP ======
+# ===== BOT SETUP =====
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ====== LOAD & SAVE ======
-def load_data():
-    try:
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
+# ===== DATABASE HELPERS =====
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS base_power (
+                    user_id TEXT,
+                    base_name TEXT,
+                    total_minutes INTEGER,
+                    set_at TIMESTAMPTZ,
+                    warned BOOLEAN DEFAULT FALSE,
+                    PRIMARY KEY(user_id, base_name)
+                )
+            """)
+        conn.commit()
 
-power_data = load_data()
+def set_base_power(uid, base, total_minutes):
+    now_utc = datetime.now(UTC)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO base_power (user_id, base_name, total_minutes, set_at, warned)
+                VALUES (%s, %s, %s, %s, FALSE)
+                ON CONFLICT(user_id, base_name)
+                DO UPDATE SET total_minutes = EXCLUDED.total_minutes,
+                              set_at = EXCLUDED.set_at,
+                              warned = FALSE
+            """, (uid, base, total_minutes, now_utc))
+        conn.commit()
 
-# ====== PARSE DURATION ======
-def parse_power_duration(duration_str):
-    """
-    Parses a string like '19d 17h 52m' and returns total minutes.
-    """
+def get_user_bases(uid):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT base_name, total_minutes, set_at, warned
+                FROM base_power
+                WHERE user_id=%s
+            """, (uid,))
+            rows = cur.fetchall()
+    return [{"base_name": r[0], "total_minutes": r[1], "set_at": r[2], "warned": r[3]} for r in rows]
+
+def get_all_bases():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id, base_name, total_minutes, set_at, warned
+                FROM base_power
+            """)
+            rows = cur.fetchall()
+    return [{"user_id": r[0], "base_name": r[1], "total_minutes": r[2], "set_at": r[3], "warned": r[4]} for r in rows]
+
+def set_warned(uid, base):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE base_power
+                SET warned = TRUE
+                WHERE user_id = %s AND base_name = %s
+            """, (uid, base))
+        conn.commit()
+
+# ===== TIME PARSER =====
+def parse_duration(text):
     pattern = r"(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?"
-    match = re.fullmatch(pattern, duration_str.strip())
+    match = re.fullmatch(pattern.strip().lower(), text)
     if not match:
         return None
+    d, h, m = match.groups(default="0")
+    return int(d) * 1440 + int(h) * 60 + int(m)
 
-    days, hours, minutes = match.groups(default="0")
-    total_minutes = int(days)*24*60 + int(hours)*60 + int(minutes)
-    return total_minutes
+def format_minutes(minutes):
+    if minutes <= 0:
+        return "Expired"
+    d, r = divmod(minutes, 1440)
+    h, m = divmod(r, 60)
+    return f"{d}d {h}h {m}m"
 
-# ====== COMMANDS ======
-@bot.command(name="setpower")
-async def set_power(ctx, base_name: str, *, power_str: str):
-    """
-    Set power for a specific base.
-    Example: !setpower Alpha 19d 17h 52m
-    """
-    total_minutes = parse_power_duration(power_str)
-    if total_minutes is None:
-        await ctx.send("❌ Invalid format! Use like `!setpower Alpha 19d 17h 52m`")
+# ===== COMMANDS =====
+@bot.command()
+async def setpower(ctx, base: str, *, duration: str):
+    minutes = parse_duration(duration)
+    if minutes is None:
+        await ctx.send("❌ Use format like: `19d 17h 52m`")
+        return
+    uid = str(ctx.author.id)
+    set_base_power(uid, base, minutes)
+    await ctx.send(f"✅ **{base}** set to `{duration}`")
+
+@bot.command()
+async def mypower(ctx):
+    uid = str(ctx.author.id)
+    bases = get_user_bases(uid)
+    if not bases:
+        await ctx.send("No bases set.")
         return
 
-    user_id = str(ctx.author.id)
-    now_iso = datetime.now(timezone(timedelta(hours=1))).isoformat()  # CET
-
-    # Initialize list if first base for this user
-    if user_id not in power_data:
-        power_data[user_id] = []
-
-    # Check if base already exists, replace it
-    updated = False
-    for entry in power_data[user_id]:
-        if entry["base_name"].lower() == base_name.lower():
-            entry.update({
-                "raw": power_str,
-                "minutes": total_minutes,
-                "timestamp": now_iso
-            })
-            updated = True
-            break
-
-    # If new base, append
-    if not updated:
-        power_data[user_id].append({
-            "base_name": base_name,
-            "raw": power_str,
-            "minutes": total_minutes,
-            "timestamp": now_iso
-        })
-
-    save_data(power_data)
-    await ctx.send(f"✅ {ctx.author.display_name}, base **{base_name}** set to **{power_str}** ({total_minutes} minutes).")
-
-@bot.command(name="mypower")
-async def my_power(ctx):
-    """Show all bases for the user."""
-    user_id = str(ctx.author.id)
-    if user_id not in power_data or len(power_data[user_id]) == 0:
-        await ctx.send("You haven’t set any bases yet! Use `!setpower <BaseName> <Duration>`.")
-        return
-
-    lines = [f"🔋 {ctx.author.display_name}'s Bases:"]
-    for entry in power_data[user_id]:
-        lines.append(f"{entry['base_name']}: {entry['raw']} (last updated {entry['timestamp']})")
+    now_utc = datetime.now(UTC)
+    lines = [f"🔋 **{ctx.author.display_name}'s Bases:**"]
+    for info in bases:
+        set_at = info["set_at"]
+        if set_at.tzinfo is None:
+            set_at = UTC.localize(set_at)
+        elapsed = int((now_utc - set_at).total_seconds() / 60)
+        remaining = info["total_minutes"] - elapsed
+        lines.append(f"**{info['base_name']}** → {format_minutes(remaining)}")
     await ctx.send("\n".join(lines))
 
-@bot.command(name="listpower")
-async def list_power(ctx):
-    """List all users and all their bases."""
-    if not power_data:
-        await ctx.send("No power levels have been set yet.")
-        return
-
-    lines = ["📋 **All Power Levels**"]
-    for user_entries in power_data.values():
-        for entry in user_entries:
-            lines.append(f"{entry['base_name']} ({entry['name'] if 'name' in entry else 'User'}): {entry['raw']} ✦ updated {entry['timestamp']}")
-    await ctx.send("\n".join(lines))
-
-# ====== DAILY REPORT TASK ======
-CET = timezone(timedelta(hours=1))  # Fixed CET offset
-
+# ===== TRACKER LOOP =====
 @tasks.loop(minutes=1)
-async def daily_report():
-    now = datetime.now(CET)
-    if now.hour == NOTIFY_HOUR_CET and now.minute == 0:
-        channel = bot.get_channel(682623773442179072)
-        if not channel:
-            return
-        if not power_data:
-            await channel.send("No power levels set yet! Use `!setpower` to add your data.")
-            return
+async def tracker():
+    now_utc = datetime.now(UTC)
+    all_bases = get_all_bases()
+    for entry in all_bases:
+        uid = entry["user_id"]
+        base = entry["base_name"]
+        total_minutes = entry["total_minutes"]
+        set_at = entry["set_at"]
+        warned = entry["warned"]
 
-        lines = ["📅 **Daily Power Report**"]
-        for user_entries in power_data.values():
-            for entry in user_entries:
-                lines.append(f"{entry['base_name']} ({entry['raw']})")
-        await channel.send("\n".join(lines))
+        if set_at.tzinfo is None:
+            set_at = UTC.localize(set_at)
 
-# ====== START LOOP IN on_ready ======
+        elapsed = int((now_utc - set_at).total_seconds() / 60)
+        remaining = total_minutes - elapsed
+
+        if 0 < remaining <= 1440 and not warned:
+            set_warned(uid, base)
+            user = bot.get_user(int(uid))
+            if user:
+                try:
+                    await user.send(f"⚠️ **{base}** has less than 1 day remaining ({format_minutes(remaining)})")
+                except:
+                    pass
+
+    # Daily report at 13:00 UTC
+    if now_utc.hour == 13 and now_utc.minute == 0:
+        channel = bot.get_channel(DAILY_CHANNEL_ID)
+        if channel:
+            lines = ["📅 **Daily Base Power Report:**"]
+            for entry in all_bases:
+                set_at = entry["set_at"]
+                if set_at.tzinfo is None:
+                    set_at = UTC.localize(set_at)
+                elapsed = int((now_utc - set_at).total_seconds() / 60)
+                remaining = entry["total_minutes"] - elapsed
+                lines.append(f"**{entry['base_name']}** → {format_minutes(remaining)}")
+            await channel.send("\n".join(lines))
+
+@tracker.before_loop
+async def before_tracker():
+    await bot.wait_until_ready()
+
+# ===== START =====
+init_db()
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    if not daily_report.is_running():
-        daily_report.start()
+    if not tracker.is_running():
+        tracker.start()
 
-# ====== RUN ======
 bot.run(TOKEN)

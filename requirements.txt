@@ -1,2 +1,4 @@
 discord.py==2.6.4
-aiohttp
+pytz==2025.2
+psycopg2-binary==2.9.11
+
