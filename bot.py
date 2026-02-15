@@ -155,6 +155,20 @@ async def tracker():
         elapsed = int((now_utc - set_at).total_seconds() / 60)
         remaining = total_minutes - elapsed
 
+    # If expired → delete it
+if remaining <= 0:
+    print(f"[Tracker] {base} expired. Deleting...")
+    delete_base(uid, base)
+
+    try:
+        user = await bot.fetch_user(int(uid))
+        await user.send(f"💀 **{base}** has expired and has been removed.")
+    except Exception as e:
+        print(f"Failed to notify user about expiration: {e}")
+
+    continue  # move to next base
+    
+
         # Debug logging
         print(f"[Tracker] {base} (User {uid}) → Remaining: {remaining} mins, Warned: {warned}")
 
