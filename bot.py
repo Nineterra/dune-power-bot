@@ -80,6 +80,15 @@ def set_warned(uid, base):
             """, (uid, base))
         conn.commit()
 
+def delete_base(user_id, base_name):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM base_power
+                WHERE user_id=%s AND base_name=%s
+            """, (user_id, base_name))
+
+
 # ===== TIME PARSER =====
 def parse_duration(text):
     pattern = r"(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?"
