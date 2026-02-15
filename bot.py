@@ -7,9 +7,9 @@ from pytz import UTC
 import psycopg2
 
 # ===== CONFIG =====
-TOKEN = os.environ["DISCORD_TOKEN"]        
-DATABASE_URL = os.environ["DATABASE_URL"]  
-DAILY_CHANNEL_ID = 1471493742879051972    
+TOKEN = os.environ["DISCORD_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+DAILY_CHANNEL_ID = 1471493742879051972
 
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
@@ -87,7 +87,7 @@ def delete_base(user_id, base_name):
                 DELETE FROM base_power
                 WHERE user_id=%s AND base_name=%s
             """, (user_id, base_name))
-
+        conn.commit()
 
 # ===== TIME PARSER =====
 def parse_duration(text):
@@ -126,13 +126,17 @@ async def mypower(ctx):
 
     now_utc = datetime.now(UTC)
     lines = [f"🔋 **{ctx.author.display_name}'s Bases:**"]
+
     for info in bases:
         set_at = info["set_at"]
         if set_at.tzinfo is None:
             set_at = UTC.localize(set_at)
+
         elapsed = int((now_utc - set_at).total_seconds() / 60)
         remaining = info["total_minutes"] - elapsed
+
         lines.append(f"**{info['base_name']}** → {format_minutes(remaining)}")
+
     await ctx.send("\n".join(lines))
 
 # ===== TRACKER LOOP =====
@@ -148,50 +152,46 @@ async def tracker():
         set_at = entry["set_at"]
         warned = entry["warned"]
 
-        # Ensure set_at has timezone
         if set_at.tzinfo is None:
             set_at = UTC.localize(set_at)
 
         elapsed = int((now_utc - set_at).total_seconds() / 60)
         remaining = total_minutes - elapsed
 
-    # If expired → delete it
-if remaining <= 0:
-    print(f"[Tracker] {base} expired. Deleting...")
-    delete_base(uid, base)
+        print(f"[Tracker] {base} → Remaining: {remaining} mins")
 
-    try:
-        user = await bot.fetch_user(int(uid))
-        await user.send(f"💀 **{base}** has expired and has been removed.")
-    except Exception as e:
-        print(f"Failed to notify user about expiration: {e}")
-
-    continue  # move to next base
-    
-
-        # Debug logging
-        print(f"[Tracker] {base} (User {uid}) → Remaining: {remaining} mins, Warned: {warned}")
-
-        # Warn if less than 1 day remaining and not yet warned
-        if 0 < remaining <= 1440 and not warned:
-            set_warned(uid, base)
-
+        # 🔴 Expired → DM + delete
+        if remaining <= 0:
             try:
-                user = await bot.fetch_user(int(uid))  # More reliable than get_user
+                user = await bot.fetch_user(int(uid))
                 await user.send(
-                    f"⚠️ **{base}** has less than **1 day** remaining "
+                    f"💀 **{base}** has expired and was removed from tracking."
+                )
+            except Exception as e:
+                print(f"Failed to send expiry DM: {e}")
+
+            delete_base(uid, base)
+            print(f"[Tracker] {base} deleted.")
+            continue
+
+        # 🟡 Warning at < 1 day
+        if remaining <= 1440 and not warned:
+            set_warned(uid, base)
+            try:
+                user = await bot.fetch_user(int(uid))
+                await user.send(
+                    f"⚠️ **{base}** has less than 1 day remaining "
                     f"({format_minutes(remaining)})"
                 )
-                print(f"[Tracker] Warning sent to {uid} for base {base}")
             except Exception as e:
-                print(f"[Tracker] Failed to send warning to {uid}: {e}")
+                print(f"Failed to send warning DM: {e}")
 
-    # Daily report at 13:00 UTC
+    # 📅 Daily report at 13:00 UTC
     if now_utc.hour == 13 and now_utc.minute == 0:
         channel = bot.get_channel(DAILY_CHANNEL_ID)
         if channel:
             lines = ["📅 **Daily Base Power Report:**"]
-            for entry in all_bases:
+            for entry in get_all_bases():
                 set_at = entry["set_at"]
                 if set_at.tzinfo is None:
                     set_at = UTC.localize(set_at)
@@ -201,9 +201,9 @@ if remaining <= 0:
             await channel.send("\n".join(lines))
             print("[Tracker] Daily report sent")
 
-
 # ===== START =====
 init_db()
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -211,4 +211,3 @@ async def on_ready():
         tracker.start()
 
 bot.run(TOKEN)
-
