@@ -9,7 +9,6 @@ import psycopg2
 # ===== CONFIG =====
 TOKEN = os.environ["DISCORD_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
-DAILY_CHANNEL_ID = None  # will be set via command
 
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
@@ -23,6 +22,7 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Base power table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS base_power (
                     user_id TEXT,
@@ -33,8 +33,16 @@ def init_db():
                     PRIMARY KEY(user_id, base_name)
                 )
             """)
+            # Settings table for report channel
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
         conn.commit()
 
+# Base management
 def set_base_power(uid, base, total_minutes):
     now_utc = datetime.now(UTC)
     with get_conn() as conn:
@@ -74,20 +82,37 @@ def set_warned(uid, base):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE base_power
-                SET warned = TRUE
-                WHERE user_id = %s AND base_name = %s
+                UPDATE base_power SET warned=TRUE
+                WHERE user_id=%s AND base_name=%s
             """, (uid, base))
         conn.commit()
 
-def delete_base(user_id, base_name):
+def delete_base(uid, base):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 DELETE FROM base_power
                 WHERE user_id=%s AND base_name=%s
-            """, (user_id, base_name))
+            """, (uid, base))
         conn.commit()
+
+# Settings helpers
+def set_report_channel(channel_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO settings (key, value)
+                VALUES ('daily_channel', %s)
+                ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+            """, (str(channel_id),))
+        conn.commit()
+
+def get_report_channel():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM settings WHERE key='daily_channel'")
+            result = cur.fetchone()
+    return int(result[0]) if result else None
 
 # ===== TIME PARSER =====
 def parse_duration(text):
@@ -96,7 +121,7 @@ def parse_duration(text):
     if not match:
         return None
     d, h, m = match.groups(default="0")
-    return int(d) * 1440 + int(h) * 60 + int(m)
+    return int(d)*1440 + int(h)*60 + int(m)
 
 def format_minutes(minutes):
     if minutes <= 0:
@@ -123,7 +148,6 @@ async def mypower(ctx):
     if not bases:
         await ctx.send("No bases set.")
         return
-
     now_utc = datetime.now(UTC)
     lines = [f"🔋 **{ctx.author.display_name}'s Bases:**"]
     for info in bases:
@@ -135,11 +159,9 @@ async def mypower(ctx):
         lines.append(f"**{info['base_name']}** → {format_minutes(remaining)}")
     await ctx.send("\n".join(lines))
 
-@bot.command(name="setreportchannel")
-@commands.has_permissions(manage_guild=True)
-async def set_report_channel(ctx, channel: discord.TextChannel):
-    global DAILY_CHANNEL_ID
-    DAILY_CHANNEL_ID = channel.id
+@bot.command()
+async def setreportchannel(ctx, channel: discord.TextChannel):
+    set_report_channel(channel.id)
     await ctx.send(f"✅ Daily report channel set to {channel.mention}")
 
 # ===== TRACKER LOOP =====
@@ -147,6 +169,8 @@ async def set_report_channel(ctx, channel: discord.TextChannel):
 async def tracker():
     now_utc = datetime.now(UTC)
     all_bases = get_all_bases()
+    daily_channel_id = get_report_channel()
+    channel = bot.get_channel(daily_channel_id) if daily_channel_id else None
 
     for entry in all_bases:
         uid = entry["user_id"]
@@ -161,64 +185,63 @@ async def tracker():
         elapsed = int((now_utc - set_at).total_seconds() / 60)
         remaining = total_minutes - elapsed
 
-        print(f"[Tracker] {base} → Remaining: {remaining} mins")
-
-        # Expired → DM + delete
+        # 🔴 Expired → DM + delete
         if remaining <= 0:
             try:
                 user = await bot.fetch_user(int(uid))
                 await user.send(f"💀 **{base}** has expired and was removed from tracking.")
             except Exception as e:
-                print(f"Failed to send expiry DM: {e}")
+                print(f"Failed expiry DM: {e}")
             delete_base(uid, base)
             continue
 
-        # Warning at <1 day
+        # 🟡 Warning at <1 day
         if remaining <= 1440 and not warned:
             set_warned(uid, base)
             try:
                 user = await bot.fetch_user(int(uid))
                 await user.send(f"⚠️ **{base}** has less than 1 day remaining ({format_minutes(remaining)})")
             except Exception as e:
-                print(f"Failed to send warning DM: {e}")
+                print(f"Failed warning DM: {e}")
 
-    # Daily report at 13:00 UTC
-    if DAILY_CHANNEL_ID and now_utc.hour == 13 and now_utc.minute == 0:
-        channel = bot.get_channel(DAILY_CHANNEL_ID)
-        if channel:
-            report_data = []
-            for entry in get_all_bases():
-                set_at = entry["set_at"]
-                if set_at.tzinfo is None:
-                    set_at = UTC.localize(set_at)
-                elapsed = int((now_utc - set_at).total_seconds() / 60)
-                remaining = entry["total_minutes"] - elapsed
-                if remaining <= 0:
-                    continue
-                report_data.append({
-                    "user_name": bot.get_user(int(entry["user_id"])).display_name if bot.get_user(int(entry["user_id"])) else "Unknown",
-                    "base_name": entry["base_name"],
-                    "remaining": remaining
-                })
-            report_data.sort(key=lambda x: x["remaining"])
-            lines = ["📅 **Daily Base Power Report (Lowest → Highest):**\n"]
-            for item in report_data:
-                remaining = item["remaining"]
-                if remaining <= 360:  # 6 hours
-                    emoji = "🔴"
-                elif remaining <= 1440:  # 24 hours
-                    emoji = "🟠"
-                elif remaining <= 4320:  # 3 days
-                    emoji = "🟡"
-                else:
-                    emoji = "🟢"
-                lines.append(f"{emoji} **{item['base_name']}** ({item['user_name']}) → {format_minutes(remaining)}")
-            await channel.send("\n".join(lines))
-            print("[Tracker] Daily report sent")
+    # 📅 Daily report at 13:00 UTC
+    if channel and now_utc.hour == 13 and now_utc.minute == 0:
+        report_data = []
+        for entry in get_all_bases():
+            uid = entry["user_id"]
+            user_name = await bot.fetch_user(int(uid))
+            base_name = entry["base_name"]
+            set_at = entry["set_at"]
+            if set_at.tzinfo is None:
+                set_at = UTC.localize(set_at)
+            elapsed = int((now_utc - set_at).total_seconds() / 60)
+            remaining = entry["total_minutes"] - elapsed
+            if remaining <= 0:
+                continue
+            report_data.append({"base_name": base_name, "owner": user_name.display_name, "remaining": remaining})
+
+        # Sort lowest to highest
+        report_data.sort(key=lambda x: x["remaining"])
+
+        lines = ["📅 **Daily Base Power Report (Lowest → Highest):**\n"]
+        for item in report_data:
+            rem = item["remaining"]
+            # Emoji indicator
+            if rem <= 360:  # <6h
+                emoji = "🔴"
+            elif rem <= 1440:  # <24h
+                emoji = "🟠"
+            elif rem <= 4320:  # <3d
+                emoji = "🟡"
+            else:
+                emoji = "🟢"
+            lines.append(f"{emoji} **{item['base_name']}** ({item['owner']}) → {format_minutes(rem)}")
+
+        await channel.send("\n".join(lines))
+        print("[Tracker] Daily report sent.")
 
 # ===== START =====
 init_db()
-
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
