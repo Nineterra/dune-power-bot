@@ -232,11 +232,11 @@ async def tracker():
         lines = ["📅 **Daily Base Power Report (Lowest → Highest):**\n"]
         for item in report_data:
             remaining = item["remaining"]
-            if remaining <= 360:
+            if remaining <= 1440:
                 emoji = "🔴"
-            elif remaining <= 1440:
-                emoji = "🟠"
             elif remaining <= 4320:
+                emoji = "🟠"
+            elif remaining <= 8640:
                 emoji = "🟡"
             else:
                 emoji = "🟢"
