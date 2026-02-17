@@ -1,275 +1,184 @@
-import os
 import discord
 from discord.ext import commands, tasks
-import re
-from datetime import datetime
-from pytz import UTC
-import psycopg2
+from discord import app_commands
+import sqlite3
+import datetime
 
-# ===== CONFIG =====
-TOKEN = os.environ["DISCORD_TOKEN"]
-DATABASE_URL = os.environ["DATABASE_URL"]
+TOKEN = "YOUR_BOT_TOKEN"
 
-# ===== BOT SETUP =====
 intents = discord.Intents.default()
+intents.members = True
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===== DATABASE HELPERS =====
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+# ---------------- DATABASE ---------------- #
 
-def init_db():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # Base power table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS base_power (
-                    user_id TEXT,
-                    base_name TEXT,
-                    total_minutes INTEGER,
-                    set_at TIMESTAMPTZ,
-                    warned BOOLEAN DEFAULT FALSE,
-                    PRIMARY KEY(user_id, base_name)
-                )
-            """)
+conn = sqlite3.connect("bases.db")
+cursor = conn.cursor()
 
-            # Settings table
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS bot_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER,
+    user_id INTEGER,
+    base_name TEXT,
+    power INTEGER,
+    expires_at TEXT
+)
+""")
 
-        conn.commit()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    guild_id INTEGER PRIMARY KEY,
+    report_channel_id INTEGER
+)
+""")
 
-def set_setting(key, value):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO bot_settings (key, value)
-                VALUES (%s, %s)
-                ON CONFLICT (key)
-                DO UPDATE SET value = EXCLUDED.value
-            """, (key, value))
-        conn.commit()
+conn.commit()
 
-def get_setting(key):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT value FROM bot_settings
-                WHERE key=%s
-            """, (key,))
-            row = cur.fetchone()
-    return row[0] if row else None
+# ---------------- HELPER FUNCTIONS ---------------- #
 
-def set_base_power(uid, base, total_minutes):
-    now_utc = datetime.now(UTC)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO base_power (user_id, base_name, total_minutes, set_at, warned)
-                VALUES (%s, %s, %s, %s, FALSE)
-                ON CONFLICT(user_id, base_name)
-                DO UPDATE SET total_minutes = EXCLUDED.total_minutes,
-                              set_at = EXCLUDED.set_at,
-                              warned = FALSE
-            """, (uid, base, total_minutes, now_utc))
-        conn.commit()
+def delete_expired_bases():
+    now = datetime.datetime.utcnow().isoformat()
+    cursor.execute("DELETE FROM bases WHERE expires_at <= ?", (now,))
+    conn.commit()
 
-def get_user_bases(uid):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT base_name, total_minutes, set_at, warned
-                FROM base_power
-                WHERE user_id=%s
-            """, (uid,))
-            rows = cur.fetchall()
-    return [{"base_name": r[0], "total_minutes": r[1], "set_at": r[2], "warned": r[3]} for r in rows]
+def get_bases_sorted(guild_id):
+    cursor.execute("""
+    SELECT user_id, base_name, power, expires_at
+    FROM bases
+    WHERE guild_id = ?
+    ORDER BY power ASC
+    """, (guild_id,))
+    return cursor.fetchall()
 
-def get_all_bases():
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT user_id, base_name, total_minutes, set_at, warned
-                FROM base_power
-            """)
-            rows = cur.fetchall()
-    return [{"user_id": r[0], "base_name": r[1], "total_minutes": r[2], "set_at": r[3], "warned": r[4]} for r in rows]
-
-def set_warned(uid, base):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE base_power
-                SET warned = TRUE
-                WHERE user_id = %s AND base_name = %s
-            """, (uid, base))
-        conn.commit()
-
-def delete_base(user_id, base_name):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM base_power
-                WHERE user_id=%s AND base_name=%s
-            """, (user_id, base_name))
-        conn.commit()
-
-# ===== TIME PARSER =====
-def parse_duration(text):
-    pattern = r"(?:(\d+)d)?\s*(?:(\d+)h)?\s*(?:(\d+)m)?"
-    match = re.fullmatch(pattern.strip().lower(), text)
-    if not match:
-        return None
-    d, h, m = match.groups(default="0")
-    return int(d) * 1440 + int(h) * 60 + int(m)
-
-def format_minutes(minutes):
-    if minutes <= 0:
-        return "Expired"
-    d, r = divmod(minutes, 1440)
-    h, m = divmod(r, 60)
-    return f"{d}d {h}h {m}m"
-
-# ===== COMMANDS =====
-@bot.command()
-async def setpower(ctx, base: str, *, duration: str):
-    minutes = parse_duration(duration)
-    if minutes is None:
-        await ctx.send("❌ Use format like: `19d 17h 52m`")
-        return
-    set_base_power(str(ctx.author.id), base, minutes)
-    await ctx.send(f"✅ **{base}** set to `{duration}`")
-
-@bot.command()
-async def mypower(ctx):
-    bases = get_user_bases(str(ctx.author.id))
-    if not bases:
-        await ctx.send("No bases set.")
-        return
-
-    now_utc = datetime.now(UTC)
-    lines = [f"🔋 **{ctx.author.display_name}'s Bases:**"]
-
-    for info in bases:
-        set_at = info["set_at"]
-        if set_at.tzinfo is None:
-            set_at = UTC.localize(set_at)
-
-        elapsed = int((now_utc - set_at).total_seconds() / 60)
-        remaining = info["total_minutes"] - elapsed
-        lines.append(f"**{info['base_name']}** → {format_minutes(remaining)}")
-
-    await ctx.send("\n".join(lines))
-
-# 🛠 Set daily report channel (Admin only)
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setreportchannel(ctx):
-    set_setting("daily_channel_id", str(ctx.channel.id))
-    await ctx.send(f"✅ Daily report channel set to {ctx.channel.mention}")
-
-# ===== TRACKER LOOP =====
-@tasks.loop(minutes=1)
-async def tracker():
-    now_utc = datetime.now(UTC)
-    all_bases = get_all_bases()
-
-    for entry in all_bases:
-        uid = entry["user_id"]
-        base = entry["base_name"]
-        total_minutes = entry["total_minutes"]
-        set_at = entry["set_at"]
-        warned = entry["warned"]
-
-        if set_at.tzinfo is None:
-            set_at = UTC.localize(set_at)
-
-        elapsed = int((now_utc - set_at).total_seconds() / 60)
-        remaining = total_minutes - elapsed
-
-        # Expired
-        if remaining <= 0:
-            try:
-                user = await bot.fetch_user(int(uid))
-                await user.send(f"💀 **{base}** has expired and was removed.")
-            except Exception as e:
-                print(f"Expiry DM failed: {e}")
-
-            delete_base(uid, base)
-            continue
-
-        # Warning
-        if remaining <= 1440 and not warned:
-            set_warned(uid, base)
-            try:
-                user = await bot.fetch_user(int(uid))
-                await user.send(
-                    f"⚠️ **{base}** has less than 1 day remaining "
-                    f"({format_minutes(remaining)})"
-                )
-            except Exception as e:
-                print(f"Warning DM failed: {e}")
-
-    # 📅 Daily report
-    if now_utc.hour == 13 and now_utc.minute == 0:
-        channel_id = get_setting("daily_channel_id")
-        if not channel_id:
-            return
-
-        channel = bot.get_channel(int(channel_id))
-        if not channel:
-            return
-
-        report_data = []
-
-        for entry in get_all_bases():
-            set_at = entry["set_at"]
-            if set_at.tzinfo is None:
-                set_at = UTC.localize(set_at)
-
-            elapsed = int((now_utc - set_at).total_seconds() / 60)
-            remaining = entry["total_minutes"] - elapsed
-
-            if remaining <= 0:
-                continue
-
-            report_data.append({
-                "base_name": entry["base_name"],
-                "remaining": remaining
-            })
-
-        report_data.sort(key=lambda x: x["remaining"])
-
-        lines = ["📅 **Daily Base Power Report (Lowest → Highest):**\n"]
-
-        for item in report_data:
-            r = item["remaining"]
-
-            if r <= 360:
-                emoji = "🔴"
-            elif r <= 1440:
-                emoji = "🟠"
-            elif r <= 4320:
-                emoji = "🟡"
-            else:
-                emoji = "🟢"
-
-            lines.append(f"{emoji} **{item['base_name']}** → {format_minutes(r)}")
-
-        await channel.send("\n".join(lines))
-
-# ===== START =====
-init_db()
+# ---------------- EVENTS ---------------- #
 
 @bot.event
 async def on_ready():
+    await bot.tree.sync()
+    daily_report.start()
     print(f"Logged in as {bot.user}")
-    if not tracker.is_running():
-        tracker.start()
+
+# ---------------- COMMANDS ---------------- #
+
+@bot.tree.command(name="addbase", description="Add a base")
+@app_commands.describe(name="Base name", power="Base power", hours="How many hours until expiration")
+async def add_base(interaction: discord.Interaction, name: str, power: int, hours: int):
+
+    expires = datetime.datetime.utcnow() + datetime.timedelta(hours=hours)
+
+    cursor.execute("""
+    INSERT INTO bases (guild_id, user_id, base_name, power, expires_at)
+    VALUES (?, ?, ?, ?, ?)
+    """, (
+        interaction.guild.id,
+        interaction.user.id,
+        name,
+        power,
+        expires.isoformat()
+    ))
+
+    conn.commit()
+
+    await interaction.response.send_message(
+        f"🏰 Base **{name}** added!\n⚡ Power: {power}\n⏳ Expires in: {hours} hours",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="setreportchannel", description="Set the daily report channel")
+async def set_report_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+
+    cursor.execute("""
+    INSERT INTO settings (guild_id, report_channel_id)
+    VALUES (?, ?)
+    ON CONFLICT(guild_id)
+    DO UPDATE SET report_channel_id=excluded.report_channel_id
+    """, (interaction.guild.id, channel.id))
+
+    conn.commit()
+
+    await interaction.response.send_message(
+        f"📢 Daily report channel set to {channel.mention}",
+        ephemeral=True
+    )
+
+# ---------------- DAILY REPORT ---------------- #
+
+@tasks.loop(hours=24)
+async def daily_report():
+
+    delete_expired_bases()
+
+    for guild in bot.guilds:
+
+        cursor.execute("SELECT report_channel_id FROM settings WHERE guild_id = ?", (guild.id,))
+        result = cursor.fetchone()
+
+        if not result:
+            continue
+
+        channel_id = result[0]
+        channel = guild.get_channel(channel_id)
+
+        if not channel:
+            continue
+
+        bases = get_bases_sorted(guild.id)
+
+        if not bases:
+            await channel.send("📭 No active bases today.")
+            continue
+
+        embed = discord.Embed(
+            title="📊 Daily Base Report",
+            color=discord.Color.blue()
+        )
+
+        description = ""
+
+        for user_id, base_name, power, expires_at in bases:
+
+            member = guild.get_member(user_id)
+            owner_name = member.display_name if member else "Unknown User"
+
+            expires_time = datetime.datetime.fromisoformat(expires_at)
+            time_left = expires_time - datetime.datetime.utcnow()
+
+            hours_left = int(time_left.total_seconds() // 3600)
+
+            description += (
+                f"🏰 **{base_name}**\n"
+                f"👤 Owner: {owner_name}\n"
+                f"⚡ Power: {power}\n"
+                f"⏳ {hours_left}h remaining\n\n"
+            )
+
+        embed.description = description
+
+        await channel.send(embed=embed)
+
+# ---------------- AUTO DM NOTIFICATIONS ---------------- #
+
+@tasks.loop(minutes=30)
+async def expiration_check():
+
+    now = datetime.datetime.utcnow()
+    cursor.execute("SELECT id, user_id, base_name, expires_at FROM bases")
+    bases = cursor.fetchall()
+
+    for base_id, user_id, base_name, expires_at in bases:
+
+        expire_time = datetime.datetime.fromisoformat(expires_at)
+        time_left = expire_time - now
+
+        if 0 < time_left.total_seconds() <= 3600:
+
+            user = await bot.fetch_user(user_id)
+            try:
+                await user.send(f"⚠️ Your base **{base_name}** expires within 1 hour!")
+            except:
+                pass
 
 bot.run(TOKEN)
