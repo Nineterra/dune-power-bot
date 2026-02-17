@@ -186,22 +186,55 @@ async def tracker():
             except Exception as e:
                 print(f"Failed to send warning DM: {e}")
 
-    # 📅 Daily report at 13:00 UTC
-    if now_utc.hour == 13 and now_utc.minute == 0:
-        channel = bot.get_channel(DAILY_CHANNEL_ID)
-        if channel:
-            lines = ["📅 **Daily Base Power Report:**"]
-            for entry in get_all_bases():
-                set_at = entry["set_at"]
-                if set_at.tzinfo is None:
-                    set_at = UTC.localize(set_at)
-                elapsed = int((now_utc - set_at).total_seconds() / 60)
-                remaining = entry["total_minutes"] - elapsed
-                lines.append(f"**{entry['base_name']}** → {format_minutes(remaining)}")
-            await channel.send("\n".join(lines))
-            print("[Tracker] Daily report sent")
+  # 📅 Daily report at 13:00 UTC
+if now_utc.hour == 13 and now_utc.minute == 0:
+    channel = bot.get_channel(DAILY_CHANNEL_ID)
+    if channel:
+        report_data = []
 
-# ===== START =====
+        for entry in get_all_bases():
+            set_at = entry["set_at"]
+            if set_at.tzinfo is None:
+                set_at = UTC.localize(set_at)
+
+            elapsed = int((now_utc - set_at).total_seconds() / 60)
+            remaining = entry["total_minutes"] - elapsed
+
+            # Skip expired bases (optional safety)
+            if remaining <= 0:
+                continue
+
+            report_data.append({
+                "base_name": entry["base_name"],
+                "remaining": remaining
+            })
+
+        # Sort lowest remaining first
+        report_data.sort(key=lambda x: x["remaining"])
+
+        lines = ["📅 **Daily Base Power Report (Lowest → Highest):**\n"]
+
+        for item in report_data:
+            remaining = item["remaining"]
+
+            # 🎨 Danger tier emojis
+            if remaining <= 360:  # 6 hours
+                emoji = "🔴"
+            elif remaining <= 1440:  # 24 hours
+                emoji = "🟠"
+            elif remaining <= 4320:  # 3 days
+                emoji = "🟡"
+            else:
+                emoji = "🟢"
+
+            lines.append(
+                f"{emoji} **{item['base_name']}** → {format_minutes(remaining)}"
+            )
+
+        await channel.send("\n".join(lines))
+        print("[Tracker] Daily report sent (sorted + emoji)")
+
+
 init_db()
 
 @bot.event
