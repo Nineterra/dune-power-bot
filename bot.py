@@ -1,53 +1,46 @@
 import discord
 from discord.ext import commands, tasks
-import json
+import asyncpg
 import os
 from datetime import datetime, timedelta
 import pytz
 
 # ===== CONFIG =====
-TOKEN = "YOUR_BOT_TOKEN"
-DATA_FILE = "power_data.json"
+TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 CET = pytz.timezone("Europe/Berlin")
 
-# ===== LOAD / SAVE =====
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {"bases": {}, "report_channel": None}
-    try:
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {"bases": {}, "report_channel": None}
-
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-data = load_data()
-
-# ===== BOT SETUP =====
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+db = None
 
-# ===== STATUS EMOJI LOGIC =====
+# ===== STATUS EMOJI =====
 def get_status_emoji(minutes_left):
-    if minutes_left <= 1440:      # 1 day
+    if minutes_left <= 1440:
         return "🔴"
-    elif minutes_left <= 4320:    # 3 days
+    elif minutes_left <= 4320:
         return "🟡"
     else:
         return "🟢"
 
 def format_remaining(td):
-    total_seconds = int(td.total_seconds())
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
+    total = int(td.total_seconds())
+    days = total // 86400
+    hours = (total % 86400) // 3600
+    minutes = (total % 3600) // 60
     return f"{days}d {hours}h {minutes}m"
+
+# ===== DATABASE CONNECT =====
+@bot.event
+async def on_ready():
+    global db
+    db = await asyncpg.connect(DATABASE_URL)
+    print(f"Logged in as {bot.user}")
+    if not daily_report.is_running():
+        daily_report.start()
 
 # ===== COMMANDS =====
 
@@ -55,57 +48,72 @@ def format_remaining(td):
 async def setpower(ctx, base_name: str, days: int):
     expire_time = datetime.now(CET) + timedelta(days=days)
 
-    data["bases"][base_name] = {
-        "expires": expire_time.isoformat(),
-        "owner_id": ctx.author.id,
-        "owner_name": ctx.author.display_name
-    }
+    await db.execute("""
+        INSERT INTO bases (base_name, owner_id, owner_name, expires)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (base_name)
+        DO UPDATE SET
+            owner_id = EXCLUDED.owner_id,
+            owner_name = EXCLUDED.owner_name,
+            expires = EXCLUDED.expires
+    """, base_name, ctx.author.id, ctx.author.display_name, expire_time)
 
-    save_data()
     await ctx.send(f"🔋 Power set for **{base_name}** ({days} days).")
 
 @bot.command()
 async def mypower(ctx):
-    found = False
-    now = datetime.now(CET)
-    message = "🔋 **Your Bases:**\n\n"
+    rows = await db.fetch("SELECT * FROM bases WHERE owner_id = $1", ctx.author.id)
 
-    for base, info in data["bases"].items():
-        if info["owner_id"] == ctx.author.id:
-            expire_time = datetime.fromisoformat(info["expires"])
-            remaining = expire_time - now
-            if remaining.total_seconds() <= 0:
-                continue
-
-            minutes_left = int(remaining.total_seconds() / 60)
-            emoji = get_status_emoji(minutes_left)
-            message += f"{emoji} **{base}** - {format_remaining(remaining)}\n"
-            found = True
-
-    if not found:
+    if not rows:
         await ctx.send("You have no active bases.")
-    else:
-        await ctx.send(message)
+        return
+
+    now = datetime.now(CET)
+    lines = []
+
+    for row in rows:
+        remaining = row["expires"] - now
+        if remaining.total_seconds() <= 0:
+            continue
+
+        minutes_left = int(remaining.total_seconds() / 60)
+        emoji = get_status_emoji(minutes_left)
+        lines.append((minutes_left, f"{emoji} **{row['base_name']}** - {format_remaining(remaining)}"))
+
+    if not lines:
+        await ctx.send("You have no active bases.")
+        return
+
+    lines.sort(key=lambda x: x[0])
+
+    message = "🔋 **Your Bases:**\n\n"
+    for _, line in lines:
+        message += line + "\n"
+
+    await ctx.send(message)
 
 @bot.command()
 async def remove(ctx, base_name: str):
-    if base_name not in data["bases"]:
-        await ctx.send("Base not found.")
-        return
+    result = await db.execute("""
+        DELETE FROM bases
+        WHERE base_name = $1 AND owner_id = $2
+    """, base_name, ctx.author.id)
 
-    if data["bases"][base_name]["owner_id"] != ctx.author.id:
-        await ctx.send("You can only remove your own bases.")
-        return
-
-    del data["bases"][base_name]
-    save_data()
-    await ctx.send(f"🗑 Removed **{base_name}**.")
+    if result == "DELETE 0":
+        await ctx.send("Base not found or not yours.")
+    else:
+        await ctx.send(f"🗑 Removed **{base_name}**.")
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def setreportchannel(ctx):
-    data["report_channel"] = ctx.channel.id
-    save_data()
+    await db.execute("""
+        INSERT INTO config (key, value)
+        VALUES ('report_channel', $1)
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value
+    """, str(ctx.channel.id))
+
     await ctx.send("📡 This channel is now set for daily reports.")
 
 @bot.command()
@@ -115,43 +123,38 @@ async def report(ctx):
 # ===== REPORT LOGIC =====
 
 async def generate_report(channel):
-    if not data.get("report_channel"):
+    row = await db.fetchrow("SELECT value FROM config WHERE key = 'report_channel'")
+    if not row:
         return
 
     now = datetime.now(CET)
-    report_lines = []
-    expired = []
+    rows = await db.fetch("SELECT * FROM bases")
 
-    for base, info in data["bases"].items():
-        expire_time = datetime.fromisoformat(info["expires"])
-        remaining = expire_time - now
-        minutes_left = int(remaining.total_seconds() / 60)
+    lines = []
 
-        if minutes_left <= 0:
-            expired.append(base)
+    for r in rows:
+        remaining = r["expires"] - now
+
+        if remaining.total_seconds() <= 0:
+            await db.execute("DELETE FROM bases WHERE base_name = $1", r["base_name"])
             continue
 
+        minutes_left = int(remaining.total_seconds() / 60)
         emoji = get_status_emoji(minutes_left)
 
-        report_lines.append((
+        lines.append((
             minutes_left,
-            f"{emoji} **{base}** (Owner: {info['owner_name']}) - {format_remaining(remaining)}"
+            f"{emoji} **{r['base_name']}** (Owner: {r['owner_name']}) - {format_remaining(remaining)}"
         ))
 
-    # Remove expired
-    for base in expired:
-        del data["bases"][base]
-
-    save_data()
-
-    if not report_lines:
+    if not lines:
         await channel.send("No active bases.")
         return
 
-    report_lines.sort(key=lambda x: x[0])
+    lines.sort(key=lambda x: x[0])
 
     message = "🔋 **Dune Power Report** 🔋\n\n"
-    for _, line in report_lines:
+    for _, line in lines:
         message += line + "\n"
 
     await channel.send(message)
@@ -162,18 +165,13 @@ async def generate_report(channel):
 async def daily_report():
     await bot.wait_until_ready()
 
-    if not data.get("report_channel"):
+    row = await db.fetchrow("SELECT value FROM config WHERE key = 'report_channel'")
+    if not row:
         return
 
-    channel = bot.get_channel(data["report_channel"])
+    channel = bot.get_channel(int(row["value"]))
     if channel:
         await generate_report(channel)
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-    if not daily_report.is_running():
-        daily_report.start()
 
 # ===== RUN =====
 bot.run(TOKEN)
