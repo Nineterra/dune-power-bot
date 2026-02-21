@@ -13,7 +13,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # Needed to fetch member nicknames
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ===== DATABASE HELPERS =====
@@ -130,6 +130,15 @@ def format_minutes(minutes):
     h, m = divmod(r, 60)
     return f"{d}d {h}h {m}m"
 
+# ===== EMOJI STATUS =====
+def get_status_emoji(minutes_left):
+    if minutes_left <= 1440:
+        return "🔴"
+    elif minutes_left <= 4320:
+        return "🟠"
+    else:
+        return "🟢"
+
 # ===== COMMANDS =====
 @bot.command()
 async def setpower(ctx, base: str, *, duration: str):
@@ -148,7 +157,6 @@ async def mypower(ctx):
     if not bases:
         await ctx.send("No bases set.")
         return
-
     now_utc = datetime.now(UTC)
     lines = [f"🔋 **{ctx.author.display_name}'s Bases:**"]
     for info in bases:
@@ -190,32 +198,31 @@ async def tracker():
 
         if set_at.tzinfo is None:
             set_at = UTC.localize(set_at)
-
         elapsed = int((now_utc - set_at).total_seconds() / 60)
         remaining = total_minutes - elapsed
 
         # Expired → DM + delete
         if remaining <= 0:
-            try:
-                guild = bot.guilds[0]  # assuming bot is on 1 server
-                member = guild.get_member(int(uid))
-                username = member.display_name if member else "Unknown"
-                await member.send(f"💀 **{base}** has expired and was removed from tracking.")
-            except Exception as e:
-                print(f"Failed to send expiry DM: {e}")
+            for guild in bot.guilds:
+                member = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
+                if member:
+                    try:
+                        await member.send(f"💀 **{base}** has expired and was removed from tracking.")
+                    except:
+                        pass
             delete_base(uid, base)
             continue
 
         # Warning < 1 day
         if remaining <= 1440 and not warned:
             set_warned(uid, base)
-            try:
-                guild = bot.guilds[0]
-                member = guild.get_member(int(uid))
-                username = member.display_name if member else "Unknown"
-                await member.send(f"⚠️ **{base}** has less than 1 day remaining ({format_minutes(remaining)})")
-            except Exception as e:
-                print(f"Failed to send warning DM: {e}")
+            for guild in bot.guilds:
+                member = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
+                if member:
+                    try:
+                        await member.send(f"⚠️ **{base}** has less than 1 day remaining ({format_minutes(remaining)})")
+                    except:
+                        pass
 
     # Daily report at 13:00 UTC
     if now_utc.hour == 13 and now_utc.minute == 0:
@@ -251,24 +258,18 @@ async def generate_daily_report(channel):
 
     # Sort lowest → highest remaining
     report_data.sort(key=lambda x: x["remaining"])
-
     lines = ["📅 **Daily Base Power Report (Lowest → Highest):**\n"]
-    guild = bot.guilds[0] if bot.guilds else None
 
     for item in report_data:
         remaining = item["remaining"]
-        if remaining <= 1440:
-            emoji = "🔴"
-        elif remaining <= 10080:
-            emoji = "🟠"
-        else:
-            emoji = "🟢"
+        emoji = get_status_emoji(remaining)
 
         username = "Unknown"
-        if guild:
-            member = guild.get_member(int(item["user"]))
+        for guild in bot.guilds:
+            member = guild.get_member(int(item["user"])) or await guild.fetch_member(int(item["user"]))
             if member:
                 username = member.display_name
+                break
 
         lines.append(f"{emoji} **{item['base_name']}** ({username}) → {format_minutes(remaining)}")
 
